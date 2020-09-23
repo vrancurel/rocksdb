@@ -1,5 +1,5 @@
-TARGETS
 make_config.mk
+rocksdb.pc
 
 *.a
 *.arc
@@ -25,6 +25,7 @@ make_config.mk
 *.vcxproj.filters
 *.sln
 *.cmake
+.watchmanconfig
 CMakeCache.txt
 CMakeFiles/
 build/
@@ -32,19 +33,29 @@ build/
 ldb
 manifest_dump
 sst_dump
+blob_dump
+block_cache_trace_analyzer
+db_with_timestamp_basic_test
+tools/block_cache_analyzer/*.pyc
 column_aware_encoding_exp
-#util/build_version.cc
+util/build_version.cc
 build_tools/VALGRIND_LOGS/
 coverage/COVERAGE_REPORT
 .gdbhistory
 .gdb_history
 package/
-.phutil_module_cache
 unity.a
 tags
+etags
 rocksdb_dump
 rocksdb_undump
 db_test2
+trace_analyzer
+trace_analyzer_test
+block_cache_trace_analyzer
+.DS_Store
+.vs
+.vscode
 
 java/out
 java/target
@@ -60,7 +71,7 @@ rocksdb.h
 unity.cc
 java/crossbuild/.vagrant
 .vagrant/
-java/**.asc
+java/**/*.asc
 java/javadoc
 
 scan_build_report/
@@ -71,3 +82,9 @@ db_logs/
 tp2/
 fbcode/
 fbcode
+buckifier/*.pyc
+buckifier/__pycache__
+
+compile_commands.json
+clang-format-diff.py
+.py3/

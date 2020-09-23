@@ -1,3 +1,4 @@
+// Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
 // Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
@@ -5,15 +6,15 @@
 
 #include "utilities/ttl/db_ttl_impl.h"
 
-#include "db/filename.h"
 #include "db/write_batch_internal.h"
+#include "file/filename.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/env.h"
 #include "rocksdb/iterator.h"
 #include "rocksdb/utilities/db_ttl.h"
 #include "util/coding.h"
 
-namespace rocksdb {
+namespace ROCKSDB_NAMESPACE {
 
 void DBWithTTLImpl::SanitizeOptions(int32_t ttl, ColumnFamilyOptions* options,
                                     Env* env) {
@@ -33,12 +34,25 @@ void DBWithTTLImpl::SanitizeOptions(int32_t ttl, ColumnFamilyOptions* options,
 }
 
 // Open the db inside DBWithTTLImpl because options needs pointer to its ttl
-DBWithTTLImpl::DBWithTTLImpl(DB* db) : DBWithTTL(db) {}
+DBWithTTLImpl::DBWithTTLImpl(DB* db) : DBWithTTL(db), closed_(false) {}
 
 DBWithTTLImpl::~DBWithTTLImpl() {
-  // Need to stop background compaction before getting rid of the filter
-  CancelAllBackgroundWork(db_, /* wait = */ true);
-  delete GetOptions().compaction_filter;
+  if (!closed_) {
+    Close();
+  }
+}
+
+Status DBWithTTLImpl::Close() {
+  Status ret = Status::OK();
+  if (!closed_) {
+    Options default_options = GetOptions();
+    // Need to stop background compaction before getting rid of the filter
+    CancelAllBackgroundWork(db_, /* wait = */ true);
+    ret = db_->Close();
+    delete default_options.compaction_filter;
+    closed_ = true;
+  }
+  return ret;
 }
 
 Status UtilityDB::OpenTtlDB(const Options& options, const std::string& dbname,
@@ -77,8 +91,7 @@ Status DBWithTTL::Open(
     const DBOptions& db_options, const std::string& dbname,
     const std::vector<ColumnFamilyDescriptor>& column_families,
     std::vector<ColumnFamilyHandle*>* handles, DBWithTTL** dbptr,
-    std::vector<int32_t> ttls, bool read_only) {
-
+    const std::vector<int32_t>& ttls, bool read_only) {
   if (ttls.size() != column_families.size()) {
     return Status::InvalidArgument(
         "ttls size has to be the same as number of column families");
@@ -259,8 +272,8 @@ Status DBWithTTLImpl::Write(const WriteOptions& opts, WriteBatch* updates) {
     explicit Handler(Env* env) : env_(env) {}
     WriteBatch updates_ttl;
     Status batch_rewrite_status;
-    virtual Status PutCF(uint32_t column_family_id, const Slice& key,
-                         const Slice& value) override {
+    Status PutCF(uint32_t column_family_id, const Slice& key,
+                 const Slice& value) override {
       std::string value_with_ts;
       Status st = AppendTS(value, &value_with_ts, env_);
       if (!st.ok()) {
@@ -271,8 +284,8 @@ Status DBWithTTLImpl::Write(const WriteOptions& opts, WriteBatch* updates) {
       }
       return Status::OK();
     }
-    virtual Status MergeCF(uint32_t column_family_id, const Slice& key,
-                           const Slice& value) override {
+    Status MergeCF(uint32_t column_family_id, const Slice& key,
+                   const Slice& value) override {
       std::string value_with_ts;
       Status st = AppendTS(value, &value_with_ts, env_);
       if (!st.ok()) {
@@ -283,14 +296,11 @@ Status DBWithTTLImpl::Write(const WriteOptions& opts, WriteBatch* updates) {
       }
       return Status::OK();
     }
-    virtual Status DeleteCF(uint32_t column_family_id,
-                            const Slice& key) override {
+    Status DeleteCF(uint32_t column_family_id, const Slice& key) override {
       WriteBatchInternal::Delete(&updates_ttl, column_family_id, key);
       return Status::OK();
     }
-    virtual void LogData(const Slice& blob) override {
-      updates_ttl.PutLogData(blob);
-    }
+    void LogData(const Slice& blob) override { updates_ttl.PutLogData(blob); }
 
    private:
     Env* env_;
@@ -309,5 +319,16 @@ Iterator* DBWithTTLImpl::NewIterator(const ReadOptions& opts,
   return new TtlIterator(db_->NewIterator(opts, column_family));
 }
 
-}  // namespace rocksdb
+void DBWithTTLImpl::SetTtl(ColumnFamilyHandle *h, int32_t ttl) {
+  std::shared_ptr<TtlCompactionFilterFactory> filter;
+  Options opts;
+  opts = GetOptions(h);
+  filter = std::static_pointer_cast<TtlCompactionFilterFactory>(
+                                       opts.compaction_filter_factory);
+  if (!filter)
+    return;
+  filter->SetTtl(ttl);
+}
+
+}  // namespace ROCKSDB_NAMESPACE
 #endif  // ROCKSDB_LITE

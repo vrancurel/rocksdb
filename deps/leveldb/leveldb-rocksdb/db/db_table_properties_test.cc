@@ -1,7 +1,7 @@
 //  Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.
-//  This source code is licensed under the BSD-style license found in the
-//  LICENSE file in the root directory of this source tree. An additional grant
-//  of patent rights can be found in the PATENTS file in the same directory.
+//  This source code is licensed under both the GPLv2 (found in the
+//  COPYING file in the root directory) and Apache 2.0 License
+//  (found in the LICENSE.Apache file in the root directory).
 //
 // Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
@@ -13,12 +13,14 @@
 #include "db/db_test_util.h"
 #include "port/stack_trace.h"
 #include "rocksdb/db.h"
-#include "util/testharness.h"
-#include "util/testutil.h"
+#include "rocksdb/utilities/table_properties_collectors.h"
+#include "test_util/testharness.h"
+#include "test_util/testutil.h"
+#include "util/random.h"
 
 #ifndef ROCKSDB_LITE
 
-namespace rocksdb {
+namespace ROCKSDB_NAMESPACE {
 
 // A helper function that ensures the table properties returned in
 // `GetPropertiesOfAllTablesTest` is correct.
@@ -44,9 +46,11 @@ void VerifyTableProperties(DB* db, uint64_t expected_entries_size) {
 }
 }  // namespace
 
-class DBTablePropertiesTest : public DBTestBase {
+class DBTablePropertiesTest : public DBTestBase,
+                              public testing::WithParamInterface<std::string> {
  public:
-  DBTablePropertiesTest() : DBTestBase("/db_table_properties_test") {}
+  DBTablePropertiesTest()
+      : DBTestBase("/db_table_properties_test", /*env_do_fsync=*/true) {}
   TablePropertiesCollection TestGetPropertiesOfTablesInRange(
       std::vector<Range> ranges, std::size_t* num_properties = nullptr,
       std::size_t* num_files = nullptr);
@@ -138,12 +142,12 @@ TEST_F(DBTablePropertiesTest, GetPropertiesOfTablesInRange) {
   Options options;
   options.create_if_missing = true;
   options.write_buffer_size = 4096;
-  options.max_write_buffer_number = 3;
+  options.max_write_buffer_number = 2;
   options.level0_file_num_compaction_trigger = 2;
   options.level0_slowdown_writes_trigger = 2;
-  options.level0_stop_writes_trigger = 4;
+  options.level0_stop_writes_trigger = 2;
   options.target_file_size_base = 2048;
-  options.max_bytes_for_level_base = 10240;
+  options.max_bytes_for_level_base = 40960;
   options.max_bytes_for_level_multiplier = 4;
   options.hard_pending_compaction_bytes_limit = 16 * 1024;
   options.num_levels = 8;
@@ -153,12 +157,12 @@ TEST_F(DBTablePropertiesTest, GetPropertiesOfTablesInRange) {
 
   // build a decent LSM
   for (int i = 0; i < 10000; i++) {
-    ASSERT_OK(Put(test::RandomKey(&rnd, 5), RandomString(&rnd, 102)));
+    ASSERT_OK(Put(test::RandomKey(&rnd, 5), rnd.RandomString(102)));
   }
   Flush();
   dbfull()->TEST_WaitForCompact();
   if (NumTableFilesAtLevel(0) == 0) {
-    ASSERT_OK(Put(test::RandomKey(&rnd, 5), RandomString(&rnd, 102)));
+    ASSERT_OK(Put(test::RandomKey(&rnd, 5), rnd.RandomString(102)));
     Flush();
   }
 
@@ -229,7 +233,7 @@ TEST_F(DBTablePropertiesTest, GetColumnFamilyNameProperty) {
 
   // Create one table per CF, then verify it was created with the column family
   // name property.
-  for (int cf = 0; cf < 2; ++cf) {
+  for (uint32_t cf = 0; cf < 2; ++cf) {
     Put(cf, "key", "val");
     Flush(cf);
 
@@ -250,12 +254,136 @@ TEST_F(DBTablePropertiesTest, GetColumnFamilyNameProperty) {
   }
 }
 
-}  // namespace rocksdb
+TEST_F(DBTablePropertiesTest, GetDbIdentifiersProperty) {
+  CreateAndReopenWithCF({"goku"}, CurrentOptions());
+
+  for (uint32_t cf = 0; cf < 2; ++cf) {
+    Put(cf, "key", "val");
+    Put(cf, "foo", "bar");
+    Flush(cf);
+
+    TablePropertiesCollection fname_to_props;
+    ASSERT_OK(db_->GetPropertiesOfAllTables(handles_[cf], &fname_to_props));
+    ASSERT_EQ(1U, fname_to_props.size());
+
+    std::string id, sid;
+    db_->GetDbIdentity(id);
+    db_->GetDbSessionId(sid);
+    ASSERT_EQ(id, fname_to_props.begin()->second->db_id);
+    ASSERT_EQ(sid, fname_to_props.begin()->second->db_session_id);
+  }
+}
+
+class DeletionTriggeredCompactionTestListener : public EventListener {
+ public:
+  void OnCompactionBegin(DB* , const CompactionJobInfo& ci) override {
+    ASSERT_EQ(ci.compaction_reason,
+              CompactionReason::kFilesMarkedForCompaction);
+  }
+
+  void OnCompactionCompleted(DB* , const CompactionJobInfo& ci) override {
+    ASSERT_EQ(ci.compaction_reason,
+              CompactionReason::kFilesMarkedForCompaction);
+  }
+};
+
+TEST_P(DBTablePropertiesTest, DeletionTriggeredCompactionMarking) {
+  int kNumKeys = 1000;
+  int kWindowSize = 100;
+  int kNumDelsTrigger = 90;
+  std::shared_ptr<TablePropertiesCollectorFactory> compact_on_del =
+    NewCompactOnDeletionCollectorFactory(kWindowSize, kNumDelsTrigger);
+
+  Options opts = CurrentOptions();
+  opts.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
+  opts.table_properties_collector_factories.emplace_back(compact_on_del);
+
+  if(GetParam() == "kCompactionStyleUniversal") {
+    opts.compaction_style = kCompactionStyleUniversal;
+  }
+  Reopen(opts);
+
+  // add an L1 file to prevent tombstones from dropping due to obsolescence
+  // during flush
+  Put(Key(0), "val");
+  Flush();
+  MoveFilesToLevel(1);
+
+  DeletionTriggeredCompactionTestListener *listener =
+    new DeletionTriggeredCompactionTestListener();
+  opts.listeners.emplace_back(listener);
+  Reopen(opts);
+
+  for (int i = 0; i < kNumKeys; ++i) {
+    if (i >= kNumKeys - kWindowSize &&
+        i < kNumKeys - kWindowSize + kNumDelsTrigger) {
+      Delete(Key(i));
+    } else {
+      Put(Key(i), "val");
+    }
+  }
+  Flush();
+
+  dbfull()->TEST_WaitForCompact();
+  ASSERT_EQ(0, NumTableFilesAtLevel(0));
+
+  // Change the window size and deletion trigger and ensure new values take
+  // effect
+  kWindowSize = 50;
+  kNumDelsTrigger = 40;
+  static_cast<CompactOnDeletionCollectorFactory*>
+    (compact_on_del.get())->SetWindowSize(kWindowSize);
+  static_cast<CompactOnDeletionCollectorFactory*>
+    (compact_on_del.get())->SetDeletionTrigger(kNumDelsTrigger);
+  for (int i = 0; i < kNumKeys; ++i) {
+    if (i >= kNumKeys - kWindowSize &&
+        i < kNumKeys - kWindowSize + kNumDelsTrigger) {
+      Delete(Key(i));
+    } else {
+      Put(Key(i), "val");
+    }
+  }
+  Flush();
+
+  dbfull()->TEST_WaitForCompact();
+  ASSERT_EQ(0, NumTableFilesAtLevel(0));
+
+  // Change the window size to disable delete triggered compaction
+  kWindowSize = 0;
+  static_cast<CompactOnDeletionCollectorFactory*>
+    (compact_on_del.get())->SetWindowSize(kWindowSize);
+  static_cast<CompactOnDeletionCollectorFactory*>
+    (compact_on_del.get())->SetDeletionTrigger(kNumDelsTrigger);
+  for (int i = 0; i < kNumKeys; ++i) {
+    if (i >= kNumKeys - kWindowSize &&
+        i < kNumKeys - kWindowSize + kNumDelsTrigger) {
+      Delete(Key(i));
+    } else {
+      Put(Key(i), "val");
+    }
+  }
+  Flush();
+
+  dbfull()->TEST_WaitForCompact();
+  ASSERT_EQ(1, NumTableFilesAtLevel(0));
+  ASSERT_LT(0, opts.statistics->getTickerCount(COMPACT_WRITE_BYTES_MARKED));
+  ASSERT_LT(0, opts.statistics->getTickerCount(COMPACT_READ_BYTES_MARKED));
+}
+
+INSTANTIATE_TEST_CASE_P(
+    DBTablePropertiesTest,
+    DBTablePropertiesTest,
+    ::testing::Values(
+      "kCompactionStyleLevel",
+      "kCompactionStyleUniversal"
+      ));
+
+}  // namespace ROCKSDB_NAMESPACE
 
 #endif  // ROCKSDB_LITE
 
 int main(int argc, char** argv) {
-  rocksdb::port::InstallStackTraceHandler();
+  ROCKSDB_NAMESPACE::port::InstallStackTraceHandler();
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }

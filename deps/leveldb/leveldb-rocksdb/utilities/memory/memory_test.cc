@@ -1,35 +1,30 @@
 // Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.
-// This source code is licensed under the BSD-style license found in the
-// LICENSE file in the root directory of this source tree. An additional grant
-// of patent rights can be found in the PATENTS file in the same directory.
+//  This source code is licensed under both the GPLv2 (found in the
+//  COPYING file in the root directory) and Apache 2.0 License
+//  (found in the LICENSE.Apache file in the root directory).
 
 #ifndef ROCKSDB_LITE
 
-#include "db/db_impl.h"
+#include "db/db_impl/db_impl.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/table.h"
 #include "rocksdb/utilities/memory_util.h"
 #include "rocksdb/utilities/stackable_db.h"
-#include "table/block_based_table_factory.h"
+#include "table/block_based/block_based_table_factory.h"
+#include "test_util/testharness.h"
+#include "test_util/testutil.h"
+#include "util/random.h"
 #include "util/string_util.h"
-#include "util/testharness.h"
-#include "util/testutil.h"
 
-namespace rocksdb {
+namespace ROCKSDB_NAMESPACE {
 
 class MemoryTest : public testing::Test {
  public:
-  MemoryTest() : kDbDir(test::TmpDir() + "/memory_test"), rnd_(301) {
+  MemoryTest() : kDbDir(test::PerThreadDBPath("memory_test")), rnd_(301) {
     assert(Env::Default()->CreateDirIfMissing(kDbDir).ok());
   }
 
   std::string GetDBName(int id) { return kDbDir + "db_" + ToString(id); }
-
-  std::string RandomString(int len) {
-    std::string r;
-    test::RandomString(&rnd_, len, &r);
-    return r;
-  }
 
   void UpdateUsagesHistory(const std::vector<DB*>& dbs) {
     std::map<MemoryUtil::UsageType, uint64_t> usage_by_type;
@@ -43,12 +38,10 @@ class MemoryTest : public testing::Test {
   void GetCachePointersFromTableFactory(
       const TableFactory* factory,
       std::unordered_set<const Cache*>* cache_set) {
-    const BlockBasedTableFactory* bbtf =
-        dynamic_cast<const BlockBasedTableFactory*>(factory);
-    if (bbtf != nullptr) {
-      const auto bbt_opts = bbtf->table_options();
-      cache_set->insert(bbt_opts.block_cache.get());
-      cache_set->insert(bbt_opts.block_cache_compressed.get());
+    const auto bbto = factory->GetOptions<BlockBasedTableOptions>();
+    if (bbto != nullptr) {
+      cache_set->insert(bbto->block_cache.get());
+      cache_set->insert(bbto->block_cache_compressed.get());
     }
   }
 
@@ -57,6 +50,8 @@ class MemoryTest : public testing::Test {
     cache_set->clear();
 
     for (auto* db : dbs) {
+      assert(db);
+
       // Cache from DBImpl
       StackableDB* sdb = dynamic_cast<StackableDB*>(db);
       DBImpl* db_impl = dynamic_cast<DBImpl*>(sdb ? sdb->GetBaseDB() : db);
@@ -120,9 +115,9 @@ TEST_F(MemoryTest, SharedBlockCacheTotal) {
   for (int p = 0; p < opt.min_write_buffer_number_to_merge / 2; ++p) {
     for (int i = 0; i < kNumDBs; ++i) {
       for (int j = 0; j < 100; ++j) {
-        keys_by_db[i].emplace_back(RandomString(kKeySize));
+        keys_by_db[i].emplace_back(rnd_.RandomString(kKeySize));
         dbs[i]->Put(WriteOptions(), keys_by_db[i].back(),
-                    RandomString(kValueSize));
+                    rnd_.RandomString(kValueSize));
       }
       dbs[i]->Flush(FlushOptions());
     }
@@ -179,8 +174,8 @@ TEST_F(MemoryTest, MemTableAndTableReadersTotal) {
   for (int p = 0; p < opt.min_write_buffer_number_to_merge / 2; ++p) {
     for (int i = 0; i < kNumDBs; ++i) {
       for (auto* handle : vec_handles[i]) {
-        dbs[i]->Put(WriteOptions(), handle, RandomString(kKeySize),
-                    RandomString(kValueSize));
+        dbs[i]->Put(WriteOptions(), handle, rnd_.RandomString(kKeySize),
+                    rnd_.RandomString(kValueSize));
         UpdateUsagesHistory(dbs);
       }
     }
@@ -206,7 +201,7 @@ TEST_F(MemoryTest, MemTableAndTableReadersTotal) {
 
     for (int j = 0; j < 100; ++j) {
       std::string value;
-      dbs[i]->Get(ReadOptions(), RandomString(kKeySize), &value);
+      dbs[i]->Get(ReadOptions(), rnd_.RandomString(kKeySize), &value);
     }
 
     UpdateUsagesHistory(dbs);
@@ -255,7 +250,7 @@ TEST_F(MemoryTest, MemTableAndTableReadersTotal) {
     delete dbs[i];
   }
 }
-}  // namespace rocksdb
+}  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
 #if !(defined NDEBUG) || !defined(OS_WIN)
@@ -269,7 +264,7 @@ int main(int argc, char** argv) {
 #else
 #include <cstdio>
 
-int main(int argc, char** argv) {
+int main(int /*argc*/, char** /*argv*/) {
   printf("Skipped in RocksDBLite as utilities are not supported.\n");
   return 0;
 }

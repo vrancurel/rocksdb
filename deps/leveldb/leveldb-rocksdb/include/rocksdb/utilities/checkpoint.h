@@ -1,7 +1,7 @@
 // Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.
-// This source code is licensed under the BSD-style license found in the
-// LICENSE file in the root directory of this source tree. An additional grant
-// of patent rights can be found in the PATENTS file in the same directory.
+//  This source code is licensed under both the GPLv2 (found in the
+//  COPYING file in the root directory) and Apache 2.0 License
+//  (found in the LICENSE.Apache file in the root directory).
 //
 // A checkpoint is an openable snapshot of a database at a point in time.
 
@@ -9,15 +9,19 @@
 #ifndef ROCKSDB_LITE
 
 #include <string>
+#include <vector>
 #include "rocksdb/status.h"
 
-namespace rocksdb {
+namespace ROCKSDB_NAMESPACE {
 
 class DB;
+class ColumnFamilyHandle;
+struct LiveFileMetaData;
+struct ExportImportFilesMetaData;
 
 class Checkpoint {
  public:
-  // Creates a Checkpoint object to be used for creating openable sbapshots
+  // Creates a Checkpoint object to be used for creating openable snapshots
   static Status Create(DB* db, Checkpoint** checkpoint_ptr);
 
   // Builds an openable snapshot of RocksDB on the same disk, which
@@ -33,11 +37,25 @@ class Checkpoint {
   // away from the default, the checkpoint may not contain up-to-date data
   // if WAL writing is not always enabled.
   // Flush will always trigger if it is 2PC.
+  // sequence_number_ptr: if it is not nullptr, the value it points to will be
+  // set to the DB's sequence number. The default value of this parameter is
+  // nullptr.
   virtual Status CreateCheckpoint(const std::string& checkpoint_dir,
-                                  uint64_t log_size_for_flush = 0);
+                                  uint64_t log_size_for_flush = 0,
+                                  uint64_t* sequence_number_ptr = nullptr);
+
+  // Exports all live SST files of a specified Column Family onto export_dir,
+  // returning SST files information in metadata.
+  // - SST files will be created as hard links when the directory specified
+  //   is in the same partition as the db directory, copied otherwise.
+  // - export_dir should not already exist and will be created by this API.
+  // - Always triggers a flush.
+  virtual Status ExportColumnFamily(ColumnFamilyHandle* handle,
+                                    const std::string& export_dir,
+                                    ExportImportFilesMetaData** metadata);
 
   virtual ~Checkpoint() {}
 };
 
-}  // namespace rocksdb
+}  // namespace ROCKSDB_NAMESPACE
 #endif  // !ROCKSDB_LITE
