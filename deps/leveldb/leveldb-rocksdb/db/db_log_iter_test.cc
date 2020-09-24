@@ -1,7 +1,7 @@
 //  Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.
-//  This source code is licensed under the BSD-style license found in the
-//  LICENSE file in the root directory of this source tree. An additional grant
-//  of patent rights can be found in the PATENTS file in the same directory.
+//  This source code is licensed under both the GPLv2 (found in the
+//  COPYING file in the root directory) and Apache 2.0 License
+//  (found in the LICENSE.Apache file in the root directory).
 //
 // Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
@@ -15,15 +15,16 @@
 #include "db/db_test_util.h"
 #include "port/stack_trace.h"
 
-namespace rocksdb {
+namespace ROCKSDB_NAMESPACE {
 
 class DBTestXactLogIterator : public DBTestBase {
  public:
-  DBTestXactLogIterator() : DBTestBase("/db_log_iter_test") {}
+  DBTestXactLogIterator()
+      : DBTestBase("/db_log_iter_test", /*env_do_fsync=*/true) {}
 
   std::unique_ptr<TransactionLogIterator> OpenTransactionLogIter(
       const SequenceNumber seq) {
-    unique_ptr<TransactionLogIterator> iter;
+    std::unique_ptr<TransactionLogIterator> iter;
     Status status = dbfull()->GetUpdatesSince(seq, &iter);
     EXPECT_OK(status);
     EXPECT_TRUE(iter->Valid());
@@ -98,14 +99,14 @@ TEST_F(DBTestXactLogIterator, TransactionLogIteratorRace) {
   for (int test = 0; test < LOG_ITERATOR_RACE_TEST_COUNT; ++test) {
     // Setup sync point dependency to reproduce the race condition of
     // a log file moved to archived dir, in the middle of GetSortedWalFiles
-    rocksdb::SyncPoint::GetInstance()->LoadDependency(
-      { { sync_points[test][0], sync_points[test][1] },
-        { sync_points[test][2], sync_points[test][3] },
-      });
+    ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->LoadDependency({
+        {sync_points[test][0], sync_points[test][1]},
+        {sync_points[test][2], sync_points[test][3]},
+    });
 
     do {
-      rocksdb::SyncPoint::GetInstance()->ClearTrace();
-      rocksdb::SyncPoint::GetInstance()->DisableProcessing();
+      ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearTrace();
+      ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
       Options options = OptionsForLogIterTest();
       DestroyAndReopen(options);
       Put("key1", DummyString(1024));
@@ -116,13 +117,14 @@ TEST_F(DBTestXactLogIterator, TransactionLogIteratorRace) {
       dbfull()->Flush(FlushOptions());
       Put("key4", DummyString(1024));
       ASSERT_EQ(dbfull()->GetLatestSequenceNumber(), 4U);
+      dbfull()->FlushWAL(false);
 
       {
         auto iter = OpenTransactionLogIter(0);
         ExpectRecords(4, iter);
       }
 
-      rocksdb::SyncPoint::GetInstance()->EnableProcessing();
+      ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
       // trigger async flush, and log move. Well, log move will
       // wait until the GetSortedWalFiles:1 to reproduce the race
       // condition
@@ -132,6 +134,7 @@ TEST_F(DBTestXactLogIterator, TransactionLogIteratorRace) {
 
       // "key5" would be written in a new memtable and log
       Put("key5", DummyString(1024));
+      dbfull()->FlushWAL(false);
       {
         // this iter would miss "key4" if not fixed
         auto iter = OpenTransactionLogIter(0);
@@ -181,8 +184,9 @@ TEST_F(DBTestXactLogIterator, TransactionLogIteratorCorruptedLog) {
       Put("key"+ToString(i), DummyString(10));
     }
     dbfull()->Flush(FlushOptions());
+    dbfull()->FlushWAL(false);
     // Corrupt this log to create a gap
-    rocksdb::VectorLogPtr wal_files;
+    ROCKSDB_NAMESPACE::VectorLogPtr wal_files;
     ASSERT_OK(dbfull()->GetSortedWalFiles(wal_files));
     const auto logfile_path = dbname_ + "/" + wal_files.front()->PathName();
     if (mem_env_) {
@@ -194,6 +198,7 @@ TEST_F(DBTestXactLogIterator, TransactionLogIteratorCorruptedLog) {
 
     // Insert a new entry to a new log file
     Put("key1025", DummyString(10));
+    dbfull()->FlushWAL(false);
     // Try to read from the beginning. Should stop before the gap and read less
     // than 1025 entries
     auto iter = OpenTransactionLogIter(0);
@@ -245,22 +250,20 @@ TEST_F(DBTestXactLogIterator, TransactionLogIteratorBlobs) {
   auto res = OpenTransactionLogIter(0)->GetBatch();
   struct Handler : public WriteBatch::Handler {
     std::string seen;
-    virtual Status PutCF(uint32_t cf, const Slice& key,
-                         const Slice& value) override {
+    Status PutCF(uint32_t cf, const Slice& key, const Slice& value) override {
       seen += "Put(" + ToString(cf) + ", " + key.ToString() + ", " +
               ToString(value.size()) + ")";
       return Status::OK();
     }
-    virtual Status MergeCF(uint32_t cf, const Slice& key,
-                           const Slice& value) override {
+    Status MergeCF(uint32_t cf, const Slice& key, const Slice& value) override {
       seen += "Merge(" + ToString(cf) + ", " + key.ToString() + ", " +
               ToString(value.size()) + ")";
       return Status::OK();
     }
-    virtual void LogData(const Slice& blob) override {
+    void LogData(const Slice& blob) override {
       seen += "LogData(" + blob.ToString() + ")";
     }
-    virtual Status DeleteCF(uint32_t cf, const Slice& key) override {
+    Status DeleteCF(uint32_t cf, const Slice& key) override {
       seen += "Delete(" + ToString(cf) + ", " + key.ToString() + ")";
       return Status::OK();
     }
@@ -275,16 +278,18 @@ TEST_F(DBTestXactLogIterator, TransactionLogIteratorBlobs) {
       "Delete(0, key2)",
       handler.seen);
 }
-}  // namespace rocksdb
+}  // namespace ROCKSDB_NAMESPACE
 
 #endif  // !defined(ROCKSDB_LITE)
 
 int main(int argc, char** argv) {
 #if !defined(ROCKSDB_LITE)
-  rocksdb::port::InstallStackTraceHandler();
+  ROCKSDB_NAMESPACE::port::InstallStackTraceHandler();
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 #else
+  (void) argc;
+  (void) argv;
   return 0;
 #endif
 }

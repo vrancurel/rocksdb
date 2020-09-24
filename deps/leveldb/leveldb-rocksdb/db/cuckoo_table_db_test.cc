@@ -1,20 +1,22 @@
 //  Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.
-//  This source code is licensed under the BSD-style license found in the
-//  LICENSE file in the root directory of this source tree. An additional grant
-//  of patent rights can be found in the PATENTS file in the same directory.
+//  This source code is licensed under both the GPLv2 (found in the
+//  COPYING file in the root directory) and Apache 2.0 License
+//  (found in the LICENSE.Apache file in the root directory).
 
 #ifndef ROCKSDB_LITE
 
-#include "db/db_impl.h"
+#include "db/db_impl/db_impl.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
+#include "table/cuckoo/cuckoo_table_factory.h"
+#include "table/cuckoo/cuckoo_table_reader.h"
 #include "table/meta_blocks.h"
-#include "table/cuckoo_table_factory.h"
-#include "table/cuckoo_table_reader.h"
-#include "util/testharness.h"
-#include "util/testutil.h"
+#include "test_util/testharness.h"
+#include "test_util/testutil.h"
+#include "util/cast_util.h"
+#include "util/string_util.h"
 
-namespace rocksdb {
+namespace ROCKSDB_NAMESPACE {
 
 class CuckooTableDBTest : public testing::Test {
  private:
@@ -24,13 +26,13 @@ class CuckooTableDBTest : public testing::Test {
 
  public:
   CuckooTableDBTest() : env_(Env::Default()) {
-    dbname_ = test::TmpDir() + "/cuckoo_table_db_test";
+    dbname_ = test::PerThreadDBPath("cuckoo_table_db_test");
     EXPECT_OK(DestroyDB(dbname_, Options()));
     db_ = nullptr;
     Reopen();
   }
 
-  ~CuckooTableDBTest() {
+  ~CuckooTableDBTest() override {
     delete db_;
     EXPECT_OK(DestroyDB(dbname_, Options()));
   }
@@ -45,9 +47,7 @@ class CuckooTableDBTest : public testing::Test {
     return options;
   }
 
-  DBImpl* dbfull() {
-    return reinterpret_cast<DBImpl*>(db_);
-  }
+  DBImpl* dbfull() { return static_cast_with_check<DBImpl>(db_); }
 
   // The following util methods are copied from plain_table_db_test.
   void Reopen(Options* options = nullptr) {
@@ -240,7 +240,7 @@ TEST_F(CuckooTableDBTest, CompactionIntoMultipleFiles) {
 
   // Write 28 values, each 10016 B ~ 10KB
   for (int idx = 0; idx < 28; ++idx) {
-    ASSERT_OK(Put(Key(idx), std::string(10000, 'a' + idx)));
+    ASSERT_OK(Put(Key(idx), std::string(10000, 'a' + char(idx))));
   }
   dbfull()->TEST_WaitForFlushMemTable();
   ASSERT_EQ("1", FilesPerLevel());
@@ -249,7 +249,7 @@ TEST_F(CuckooTableDBTest, CompactionIntoMultipleFiles) {
                               true /* disallow trivial move */);
   ASSERT_EQ("0,2", FilesPerLevel());
   for (int idx = 0; idx < 28; ++idx) {
-    ASSERT_EQ(std::string(10000, 'a' + idx), Get(Key(idx)));
+    ASSERT_EQ(std::string(10000, 'a' + char(idx)), Get(Key(idx)));
   }
 }
 
@@ -270,19 +270,22 @@ TEST_F(CuckooTableDBTest, SameKeyInsertedInTwoDifferentFilesAndCompacted) {
 
   // Generate one more file in level-0, and should trigger level-0 compaction
   for (int idx = 0; idx < 11; ++idx) {
-    ASSERT_OK(Put(Key(idx), std::string(10000, 'a' + idx)));
+    ASSERT_OK(Put(Key(idx), std::string(10000, 'a' + char(idx))));
   }
   dbfull()->TEST_WaitForFlushMemTable();
   dbfull()->TEST_CompactRange(0, nullptr, nullptr);
 
   ASSERT_EQ("0,1", FilesPerLevel());
   for (int idx = 0; idx < 11; ++idx) {
-    ASSERT_EQ(std::string(10000, 'a' + idx), Get(Key(idx)));
+    ASSERT_EQ(std::string(10000, 'a' + char(idx)), Get(Key(idx)));
   }
 }
 
 TEST_F(CuckooTableDBTest, AdaptiveTable) {
   Options options = CurrentOptions();
+
+  // Ensure options compatible with PlainTable
+  options.prefix_extractor.reset(NewCappedPrefixTransform(8));
 
   // Write some keys using cuckoo table.
   options.table_factory.reset(NewCuckooTableFactory());
@@ -294,17 +297,25 @@ TEST_F(CuckooTableDBTest, AdaptiveTable) {
   dbfull()->TEST_FlushMemTable();
 
   // Write some keys using plain table.
+  std::shared_ptr<TableFactory> block_based_factory(
+      NewBlockBasedTableFactory());
+  std::shared_ptr<TableFactory> plain_table_factory(
+      NewPlainTableFactory());
+  std::shared_ptr<TableFactory> cuckoo_table_factory(
+      NewCuckooTableFactory());
   options.create_if_missing = false;
-  options.table_factory.reset(NewPlainTableFactory());
+  options.table_factory.reset(NewAdaptiveTableFactory(
+    plain_table_factory, block_based_factory, plain_table_factory,
+    cuckoo_table_factory));
   Reopen(&options);
   ASSERT_OK(Put("key4", "v4"));
   ASSERT_OK(Put("key1", "v5"));
   dbfull()->TEST_FlushMemTable();
 
   // Write some keys using block based table.
-  std::shared_ptr<TableFactory> block_based_factory(
-      NewBlockBasedTableFactory());
-  options.table_factory.reset(NewAdaptiveTableFactory(block_based_factory));
+  options.table_factory.reset(NewAdaptiveTableFactory(
+    block_based_factory, block_based_factory, plain_table_factory,
+    cuckoo_table_factory));
   Reopen(&options);
   ASSERT_OK(Put("key5", "v6"));
   ASSERT_OK(Put("key2", "v7"));
@@ -316,17 +327,22 @@ TEST_F(CuckooTableDBTest, AdaptiveTable) {
   ASSERT_EQ("v4", Get("key4"));
   ASSERT_EQ("v6", Get("key5"));
 }
-}  // namespace rocksdb
+}  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
-  ::testing::InitGoogleTest(&argc, argv);
-  return RUN_ALL_TESTS();
+  if (ROCKSDB_NAMESPACE::port::kLittleEndian) {
+    ::testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
+  } else {
+    fprintf(stderr, "SKIPPED as Cuckoo table doesn't support Big Endian\n");
+    return 0;
+  }
 }
 
 #else
 #include <stdio.h>
 
-int main(int argc, char** argv) {
+int main(int /*argc*/, char** /*argv*/) {
   fprintf(stderr, "SKIPPED as Cuckoo table is not supported in ROCKSDB_LITE\n");
   return 0;
 }

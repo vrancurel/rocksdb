@@ -1,7 +1,7 @@
 //  Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.
-//  This source code is licensed under the BSD-style license found in the
-//  LICENSE file in the root directory of this source tree. An additional grant
-//  of patent rights can be found in the PATENTS file in the same directory.
+//  This source code is licensed under both the GPLv2 (found in the
+//  COPYING file in the root directory) and Apache 2.0 License
+//  (found in the LICENSE.Apache file in the root directory).
 //
 // Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
@@ -10,22 +10,40 @@
 #pragma once
 #ifndef ROCKSDB_LITE
 
-#ifndef __STDC_FORMAT_MACROS
-#define __STDC_FORMAT_MACROS
-#endif
-
-#include <inttypes.h>
-#include <string>
-#include <map>
-#include <vector>
+#include <cinttypes>
 #include <functional>
+#include <map>
+#include <string>
+#include <vector>
 
 #include "rocksdb/utilities/stackable_db.h"
 
 #include "rocksdb/env.h"
+#include "rocksdb/options.h"
 #include "rocksdb/status.h"
 
-namespace rocksdb {
+namespace ROCKSDB_NAMESPACE {
+
+// The default BackupEngine file checksum function name.
+constexpr char kDefaultBackupFileChecksumFuncName[] = "crc32c";
+
+// BackupTableNameOption describes possible naming schemes for backup
+// table file names when the table files are stored in the shared_checksum
+// directory (i.e., both share_table_files and share_files_with_checksum
+// are true).
+enum BackupTableNameOption : unsigned char {
+  // Backup SST filenames are <file_number>_<crc32c>_<file_size>.sst
+  // where <crc32c> is uint32_t.
+  kChecksumAndFileSize = 0,
+  // Backup SST filenames are <file_number>_<crc32c>_<db_session_id>.sst
+  // where <crc32c> is hexidecimally encoded.
+  // When DBOptions::file_checksum_gen_factory is not set to
+  // GetFileChecksumGenCrc32cFactory(), the filenames will be
+  // <file_number>_<db_session_id>.sst
+  // When there are no db session ids available in the table file, this
+  // option will use kChecksumAndFileSize as a fallback.
+  kOptionalChecksumAndDbSessionId = 1
+};
 
 struct BackupableDBOptions {
   // Where to keep the backup files. Has to be different than dbname_
@@ -91,11 +109,18 @@ struct BackupableDBOptions {
   std::shared_ptr<RateLimiter> restore_rate_limiter{nullptr};
 
   // Only used if share_table_files is set to true. If true, will consider that
-  // backups can come from different databases, hence a sst is not uniquely
-  // identifed by its name, but by the triple (file name, crc32, file length)
-  // Default: false
-  // Note: this is an experimental option, and you'll need to set it manually
+  // backups can come from different databases, hence an sst is not uniquely
+  // identifed by its name, but by the triple
+  // (file name, crc32c, db session id or file length)
+  //
+  // Note: If this option is set to true, we recommend setting
+  // share_files_with_checksum_naming to kOptionalChecksumAndDbSessionId, which
+  // is also our default option. Otherwise, there is a non-negligible chance of
+  // filename collision when sharing tables in shared_checksum among several
+  // DBs.
   // *turn it on only if you know what you're doing*
+  //
+  // Default: false
   bool share_files_with_checksum;
 
   // Up to this many background threads will copy files for CreateNewBackup()
@@ -108,6 +133,63 @@ struct BackupableDBOptions {
   // Default: 4194304
   uint64_t callback_trigger_interval_size;
 
+  // For BackupEngineReadOnly, Open() will open at most this many of the
+  // latest non-corrupted backups.
+  //
+  // Note: this setting is ignored (behaves like INT_MAX) for any kind of
+  // writable BackupEngine because it would inhibit accounting for shared
+  // files for proper backup deletion, including purging any incompletely
+  // created backups on creation of a new backup.
+  //
+  // Default: INT_MAX
+  int max_valid_backups_to_open;
+
+  // Naming option for share_files_with_checksum table files. This option
+  // can be set to kChecksumAndFileSize or kOptionalChecksumAndDbSessionId.
+  // kChecksumAndFileSize is susceptible to collision as file size is not a
+  // good source of entroy.
+  // kOptionalChecksumAndDbSessionId is immune to collision.
+  //
+  // Modifying this option cannot introduce a downgrade compatibility issue
+  // because RocksDB can read, restore, and delete backups using different file
+  // names, and it's OK for a backup directory to use a mixture of table file
+  // naming schemes.
+  //
+  // Default: kOptionalChecksumAndDbSessionId
+  //
+  // Note: This option comes into effect only if both share_files_with_checksum
+  // and share_table_files are true. In the cases of old table files where no
+  // db_session_id is stored, we use the file_size to replace the empty
+  // db_session_id as a fallback.
+  BackupTableNameOption share_files_with_checksum_naming;
+
+  // Option for custom checksum functions.
+  // When this option is nullptr, BackupEngine will use its default crc32c as
+  // the checksum function.
+  //
+  // When it is not nullptr, BackupEngine will try to find in the factory the
+  // checksum function that DB used to calculate the file checksums. If such a
+  // function is found, BackupEngine will use it to create, verify, or restore
+  // backups, in addition to the default crc32c checksum function. If such a
+  // function is not found, BackupEngine will return Status::InvalidArgument().
+  // Therefore, this option comes into effect only if DB has a custom checksum
+  // factory and this option is set to the same factory.
+  //
+  //
+  // Note: If share_files_with_checksum and share_table_files are true,
+  // the <checksum> appeared in the table filenames will be the custom checksum
+  // value if db session ids are available (namely, table file naming options
+  // is kOptionalChecksumAndDbSessionId and the db session ids obtained from
+  // the table files are nonempty).
+  //
+  // Note: We do not require the same setting to this option for backup
+  // restoration or verification as was set during backup creation but we
+  // strongly recommend setting it to the same as the DB file checksum function
+  // for all BackupEngine interactions when practical.
+  //
+  // Default: nullptr
+  std::shared_ptr<FileChecksumGenFactory> file_checksum_gen_factory;
+
   void Dump(Logger* logger) const;
 
   explicit BackupableDBOptions(
@@ -116,7 +198,12 @@ struct BackupableDBOptions {
       bool _sync = true, bool _destroy_old_data = false,
       bool _backup_log_files = true, uint64_t _backup_rate_limit = 0,
       uint64_t _restore_rate_limit = 0, int _max_background_operations = 1,
-      uint64_t _callback_trigger_interval_size = 4 * 1024 * 1024)
+      uint64_t _callback_trigger_interval_size = 4 * 1024 * 1024,
+      int _max_valid_backups_to_open = INT_MAX,
+      BackupTableNameOption _share_files_with_checksum_naming =
+          kOptionalChecksumAndDbSessionId,
+      std::shared_ptr<FileChecksumGenFactory> _file_checksum_gen_factory =
+          nullptr)
       : backup_dir(_backup_dir),
         backup_env(_backup_env),
         share_table_files(_share_table_files),
@@ -128,9 +215,30 @@ struct BackupableDBOptions {
         restore_rate_limit(_restore_rate_limit),
         share_files_with_checksum(false),
         max_background_operations(_max_background_operations),
-        callback_trigger_interval_size(_callback_trigger_interval_size) {
+        callback_trigger_interval_size(_callback_trigger_interval_size),
+        max_valid_backups_to_open(_max_valid_backups_to_open),
+        share_files_with_checksum_naming(_share_files_with_checksum_naming),
+        file_checksum_gen_factory(_file_checksum_gen_factory) {
     assert(share_table_files || !share_files_with_checksum);
   }
+};
+
+struct CreateBackupOptions {
+  // Flush will always trigger if 2PC is enabled.
+  // If write-ahead logs are disabled, set flush_before_backup=true to
+  // avoid losing unflushed key/value pairs from the memtable.
+  bool flush_before_backup = false;
+
+  // Callback for reporting progress.
+  std::function<void()> progress_callback = []() {};
+
+  // If false, background_thread_cpu_priority is ignored.
+  // Otherwise, the cpu priority can be decreased,
+  // if you try to increase the priority, the priority will not change.
+  // The initial priority of the threads is CpuPriority::kNormal,
+  // so you can decrease to priorities lower than kNormal.
+  bool decrease_background_thread_cpu_priority = false;
+  CpuPriority background_thread_cpu_priority = CpuPriority::kNormal;
 };
 
 struct RestoreOptions {
@@ -195,12 +303,18 @@ class BackupStatistics {
 
 // A backup engine for accessing information about backups and restoring from
 // them.
+// BackupEngineReadOnly is not extensible.
 class BackupEngineReadOnly {
  public:
   virtual ~BackupEngineReadOnly() {}
 
-  static Status Open(Env* db_env, const BackupableDBOptions& options,
+  static Status Open(const BackupableDBOptions& options, Env* db_env,
                      BackupEngineReadOnly** backup_engine_ptr);
+  // keep for backward compatibility.
+  static Status Open(Env* db_env, const BackupableDBOptions& options,
+                     BackupEngineReadOnly** backup_engine_ptr) {
+    return BackupEngineReadOnly::Open(options, db_env, backup_engine_ptr);
+  }
 
   // Returns info about backups in backup_info
   // You can GetBackupInfo safely, even with other BackupEngine performing
@@ -216,56 +330,107 @@ class BackupEngineReadOnly {
   // responsibility to synchronize the operation, i.e. don't delete the backup
   // when you're restoring from it
   // See also the corresponding doc in BackupEngine
+  virtual Status RestoreDBFromBackup(const RestoreOptions& options,
+                                     BackupID backup_id,
+                                     const std::string& db_dir,
+                                     const std::string& wal_dir) = 0;
+
+  // keep for backward compatibility.
   virtual Status RestoreDBFromBackup(
       BackupID backup_id, const std::string& db_dir, const std::string& wal_dir,
-      const RestoreOptions& restore_options = RestoreOptions()) = 0;
+      const RestoreOptions& options = RestoreOptions()) {
+    return RestoreDBFromBackup(options, backup_id, db_dir, wal_dir);
+  }
 
   // See the corresponding doc in BackupEngine
+  virtual Status RestoreDBFromLatestBackup(const RestoreOptions& options,
+                                           const std::string& db_dir,
+                                           const std::string& wal_dir) = 0;
+
+  // keep for backward compatibility.
   virtual Status RestoreDBFromLatestBackup(
       const std::string& db_dir, const std::string& wal_dir,
-      const RestoreOptions& restore_options = RestoreOptions()) = 0;
+      const RestoreOptions& options = RestoreOptions()) {
+    return RestoreDBFromLatestBackup(options, db_dir, wal_dir);
+  }
 
+  // If verify_with_checksum is true, this function
+  // inspects the default crc32c checksums and file sizes of backup files to
+  // see if they match our expectation. This function further inspects the
+  // custom checksums if BackupableDBOptions::file_checksum_gen_factory is
+  // the same as DBOptions::file_checksum_gen_factory.
+  //
+  // If verify_with_checksum is false, this function
   // checks that each file exists and that the size of the file matches our
-  // expectations. it does not check file checksum.
+  // expectation. It does not check file checksum.
   //
   // If this BackupEngine created the backup, it compares the files' current
-  // sizes against the number of bytes written to them during creation.
-  // Otherwise, it compares the files' current sizes against their sizes when
-  // the BackupEngine was opened.
+  // sizes (and current checksums) against the number of bytes written to
+  // them (and the checksums calculated) during creation.
+  // Otherwise, it compares the files' current sizes (and checksums) against
+  // their sizes (and checksums) when the BackupEngine was opened.
   //
   // Returns Status::OK() if all checks are good
-  virtual Status VerifyBackup(BackupID backup_id) = 0;
+  virtual Status VerifyBackup(BackupID backup_id,
+                              bool verify_with_checksum = false) = 0;
 };
 
 // A backup engine for creating new backups.
+// BackupEngine is not extensible.
 class BackupEngine {
  public:
   virtual ~BackupEngine() {}
 
   // BackupableDBOptions have to be the same as the ones used in previous
   // BackupEngines for the same backup directory.
-  static Status Open(Env* db_env,
-                     const BackupableDBOptions& options,
+  static Status Open(const BackupableDBOptions& options, Env* db_env,
                      BackupEngine** backup_engine_ptr);
 
-  // same as CreateNewBackup, but stores extra application metadata
+  // keep for backward compatibility.
+  static Status Open(Env* db_env, const BackupableDBOptions& options,
+                     BackupEngine** backup_engine_ptr) {
+    return BackupEngine::Open(options, db_env, backup_engine_ptr);
+  }
+
+  // same as CreateNewBackup, but stores extra application metadata.
+  virtual Status CreateNewBackupWithMetadata(
+      const CreateBackupOptions& options, DB* db,
+      const std::string& app_metadata) = 0;
+
+  // keep here for backward compatibility.
   virtual Status CreateNewBackupWithMetadata(
       DB* db, const std::string& app_metadata, bool flush_before_backup = false,
-      std::function<void()> progress_callback = []() {}) = 0;
+      std::function<void()> progress_callback = []() {}) {
+    CreateBackupOptions options;
+    options.flush_before_backup = flush_before_backup;
+    options.progress_callback = progress_callback;
+    return CreateNewBackupWithMetadata(options, db, app_metadata);
+  }
 
   // Captures the state of the database in the latest backup
   // NOT a thread safe call
+  virtual Status CreateNewBackup(const CreateBackupOptions& options, DB* db) {
+    return CreateNewBackupWithMetadata(options, db, "");
+  }
+
+  // keep here for backward compatibility.
   virtual Status CreateNewBackup(DB* db, bool flush_before_backup = false,
                                  std::function<void()> progress_callback =
                                      []() {}) {
-    return CreateNewBackupWithMetadata(db, "", flush_before_backup,
-                                       progress_callback);
+    CreateBackupOptions options;
+    options.flush_before_backup = flush_before_backup;
+    options.progress_callback = progress_callback;
+    return CreateNewBackup(options, db);
   }
 
-  // deletes old backups, keeping latest num_backups_to_keep alive
+  // Deletes old backups, keeping latest num_backups_to_keep alive.
+  // See also DeleteBackup.
   virtual Status PurgeOldBackups(uint32_t num_backups_to_keep) = 0;
 
-  // deletes a specific backup
+  // Deletes a specific backup. If this operation (or PurgeOldBackups)
+  // is not completed due to crash, power failure, etc. the state
+  // will be cleaned up the next time you call DeleteBackup,
+  // PurgeOldBackups, or GarbageCollect.
   virtual Status DeleteBackup(BackupID backup_id) = 0;
 
   // Call this from another thread if you want to stop the backup
@@ -273,8 +438,8 @@ class BackupEngine {
   // not wait for the backup to stop.
   // The backup will stop ASAP and the call to CreateNewBackup will
   // return Status::Incomplete(). It will not clean up after itself, but
-  // the state will remain consistent. The state will be cleaned up
-  // next time you create BackupableDB or RestoreBackupableDB.
+  // the state will remain consistent. The state will be cleaned up the
+  // next time you call CreateNewBackup or GarbageCollect.
   virtual void StopBackup() = 0;
 
   // Returns info about backups in backup_info
@@ -295,25 +460,53 @@ class BackupEngine {
   // database will diverge from backups 4 and 5 and the new backup will fail.
   // If you want to create new backup, you will first have to delete backups 4
   // and 5.
+  virtual Status RestoreDBFromBackup(const RestoreOptions& options,
+                                     BackupID backup_id,
+                                     const std::string& db_dir,
+                                     const std::string& wal_dir) = 0;
+
+  // keep for backward compatibility.
   virtual Status RestoreDBFromBackup(
       BackupID backup_id, const std::string& db_dir, const std::string& wal_dir,
-      const RestoreOptions& restore_options = RestoreOptions()) = 0;
+      const RestoreOptions& options = RestoreOptions()) {
+    return RestoreDBFromBackup(options, backup_id, db_dir, wal_dir);
+  }
 
   // restore from the latest backup
+  virtual Status RestoreDBFromLatestBackup(const RestoreOptions& options,
+                                           const std::string& db_dir,
+                                           const std::string& wal_dir) = 0;
+
+  // keep for backward compatibility.
   virtual Status RestoreDBFromLatestBackup(
       const std::string& db_dir, const std::string& wal_dir,
-      const RestoreOptions& restore_options = RestoreOptions()) = 0;
+      const RestoreOptions& options = RestoreOptions()) {
+    return RestoreDBFromLatestBackup(options, db_dir, wal_dir);
+  }
 
+  // If verify_with_checksum is true, this function
+  // inspects the current checksums and file sizes of backup files to see if
+  // they match our expectation. It further inspects the custom checksums
+  // if BackupableDBOptions::file_checksum_gen_factory is the same as
+  // DBOptions::file_checksum_gen_factory.
+  //
+  // If verify_with_checksum is false, this function
   // checks that each file exists and that the size of the file matches our
-  // expectations. it does not check file checksum.
+  // expectation. It does not check file checksum.
+  //
   // Returns Status::OK() if all checks are good
-  virtual Status VerifyBackup(BackupID backup_id) = 0;
+  virtual Status VerifyBackup(BackupID backup_id,
+                              bool verify_with_checksum = false) = 0;
 
-  // Will delete all the files we don't need anymore
-  // It will do the full scan of the files/ directory and delete all the
-  // files that are not referenced.
+  // Will delete any files left over from incomplete creation or deletion of
+  // a backup. This is not normally needed as those operations also clean up
+  // after prior incomplete calls to the same kind of operation (create or
+  // delete).
+  // NOTE: This is not designed to delete arbitrary files added to the backup
+  // directory outside of BackupEngine, and clean-up is always subject to
+  // permissions on and availability of the underlying filesystem.
   virtual Status GarbageCollect() = 0;
 };
 
-}  // namespace rocksdb
+}  // namespace ROCKSDB_NAMESPACE
 #endif  // ROCKSDB_LITE
